@@ -1,6 +1,7 @@
 package detach
 
 import (
+	"context"
 	"errors"
 	"io"
 )
@@ -9,48 +10,55 @@ import (
 // the user.
 var ErrDetach = errors.New("detached from container")
 
-// Copy is similar to io.Copy but support a detach key sequence to break out.
-func Copy(dst io.Writer, src io.Reader, keys []byte) (written int64, err error) {
+// Copy es similar a io.Copy pero admite una secuencia de teclas de separación para salir y utiliza un contexto para cancelación.
+func Copy(ctx context.Context, dst io.Writer, src io.Reader, keys []byte) (written int64, err error) {
 	buf := make([]byte, 32*1024)
+LOOP:
 	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			preservBuf := []byte{}
-			for i, key := range keys {
-				preservBuf = append(preservBuf, buf[0:nr]...)
-				if nr != 1 || buf[0] != key {
-					break
+		select {
+		case <-ctx.Done():
+			// logrus.Debug("Copy operation canceled")
+			return written, ctx.Err() // Salir si el contexto ha sido cancelado
+		default:
+			nr, er := src.Read(buf)
+			if nr > 0 {
+				preservBuf := []byte{}
+				for i, key := range keys {
+					preservBuf = append(preservBuf, buf[0:nr]...)
+					if nr != 1 || buf[0] != key {
+						break LOOP
+					}
+					if i == len(keys)-1 {
+						return 0, ErrDetach
+					}
+					nr, er = src.Read(buf)
 				}
-				if i == len(keys)-1 {
-					return 0, ErrDetach
+				var nw int
+				var ew error
+				if len(preservBuf) > 0 {
+					nw, ew = dst.Write(preservBuf)
+					nr = len(preservBuf)
+				} else {
+					nw, ew = dst.Write(buf[0:nr])
 				}
-				nr, er = src.Read(buf)
+				if nw > 0 {
+					written += int64(nw)
+				}
+				if ew != nil {
+					err = ew
+					break LOOP
+				}
+				if nr != nw {
+					err = io.ErrShortWrite
+					break LOOP
+				}
 			}
-			var nw int
-			var ew error
-			if len(preservBuf) > 0 {
-				nw, ew = dst.Write(preservBuf)
-				nr = len(preservBuf)
-			} else {
-				nw, ew = dst.Write(buf[0:nr])
+			if er != nil {
+				if er != io.EOF {
+					err = er
+				}
+				break LOOP
 			}
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
 		}
 	}
 	return written, err
